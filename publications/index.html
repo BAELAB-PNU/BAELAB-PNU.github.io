@@ -477,9 +477,7 @@ const COLLABO_PHOTOS = {
 
 };
 const COLLABO_DEFAULT_PHOTO = '/assets/img/BAELAB_LOGO.png';
-const COLLABO_FEATURED_AUTHOR_ID = 'Bae, Hyerim';
-const COLLABO_FEATURED_AUTHOR_COLOR = 'rgb(255, 255, 255)';
-const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
+const COLLABO_RESEARCH_REFERENCE_AUTHOR_ID = 'Bae, Hyerim';
 
 (() => {
   const container = document.getElementById('coauthor-graph');
@@ -889,18 +887,61 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     });
   }
 
-  // Project complete author topic profiles onto three continuous PCA color axes.
+  // Project complete author topic profiles relative to one reference researcher.
   // Rare topics hidden from the graph remain part of the color representation.
-  function createPcaAuthorColors(authorNodes, keywordNodes, links, keywordSimData = null) {
+  function createPcaAuthorColors(
+    authorNodes,
+    keywordNodes,
+    links,
+    keywordSimData = null,
+    referenceAuthorId = null
+  ) {
     const similarityPayload = keywordSimData && (keywordSimData.similarities || keywordSimData);
+    const vectorizerConfig = keywordSimData?.vectorizer || {};
+    const finiteConfig = (value, fallback, minimum, maximum) => {
+      const numericValue = Number(value);
+      return Number.isFinite(numericValue)
+        ? Math.max(minimum, Math.min(maximum, numericValue))
+        : fallback;
+    };
+    const finiteNonnegative = (value, fallback = 0) => {
+      const numericValue = Number(value);
+      return Number.isFinite(numericValue)
+        ? Math.max(0, numericValue)
+        : fallback;
+    };
     const configuredSimilarityAlpha = Number(keywordSimData?.alpha);
     const similarityAlpha = Number.isFinite(configuredSimilarityAlpha)
       ? Math.max(0, Math.min(0.75, configuredSimilarityAlpha))
-      : 0.3;
+      : 0.35;
     const configuredNeighborAlpha = Number(keywordSimData?.neighbor_alpha);
     const neighborSimilarityAlpha = Number.isFinite(configuredNeighborAlpha)
       ? Math.max(0, Math.min(0.5, configuredNeighborAlpha))
-      : Math.min(0.3, similarityAlpha);
+      : Math.min(0.25, similarityAlpha);
+    const bm25K1 = finiteConfig(vectorizerConfig.bm25_k1, 1.35, 0.1, 3);
+    const bm25B = finiteConfig(vectorizerConfig.bm25_b, 0.35, 0, 1);
+    const repeatEvidenceScale = finiteConfig(
+      vectorizerConfig.repeat_evidence_scale,
+      1.5,
+      0.25,
+      10
+    );
+    const configuredLeadAlpha = finiteConfig(
+      vectorizerConfig.lead_alpha,
+      0.3,
+      0,
+      0.3
+    );
+    const configuredRecencyAlpha = finiteConfig(
+      vectorizerConfig.recency_alpha,
+      0.1,
+      0,
+      0.25
+    );
+    const pcaMinimumPapers = Math.max(
+      1,
+      Math.floor(finiteConfig(vectorizerConfig.pca_min_papers, 1, 1, 20))
+    );
     const decodeLatentTopicSpace = payload => {
       if (
         payload?.encoding !== 'int8-base64'
@@ -966,22 +1007,41 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     const topicIds = topicNames.map(topic => 'kw:' + topic);
     const topicIndex = new Map(topicIds.map((id, index) => [id, index]));
     const authorFeatures = new Map();
+    const authorLeadFeatures = new Map();
+    const authorRecentFeatures = new Map();
     const authorsWithFullProfiles = new Set();
+    const authorsWithLeadProfiles = new Set();
+    const authorsWithRecentProfiles = new Set();
     const orderedAuthors = [...authorNodes].sort(
       (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0
     );
 
     orderedAuthors.forEach(author => {
-      const vector = new Array(topicNames.length).fill(0);
-      const profile = author.topic_profile;
-      if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
-        authorsWithFullProfiles.add(author.id);
-        Object.entries(profile).forEach(([topic, rawWeight]) => {
-          const index = topicIndex.get('kw:' + topic);
-          if (index !== undefined) vector[index] = Math.max(0, Number(rawWeight) || 0);
-        });
-      }
-      authorFeatures.set(author.id, vector);
+      const readProfile = (profile, profileSet) => {
+        const vector = new Array(topicNames.length).fill(0);
+        if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+          profileSet.add(author.id);
+          Object.entries(profile).forEach(([topic, rawWeight]) => {
+            const index = topicIndex.get('kw:' + topic);
+            if (index !== undefined) {
+              vector[index] = finiteNonnegative(rawWeight);
+            }
+          });
+        }
+        return vector;
+      };
+      authorFeatures.set(
+        author.id,
+        readProfile(author.topic_profile, authorsWithFullProfiles)
+      );
+      authorLeadFeatures.set(
+        author.id,
+        readProfile(author.lead_topic_profile, authorsWithLeadProfiles)
+      );
+      authorRecentFeatures.set(
+        author.id,
+        readProfile(author.recent_topic_profile, authorsWithRecentProfiles)
+      );
     });
 
     // Compatibility path for older JSON that only has author-keyword links.
@@ -1002,59 +1062,78 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       if (!authorFeatures.has(authorId) || authorsWithFullProfiles.has(authorId)) return;
       const index = topicIndex.get(keywordId);
       if (index !== undefined) {
-        authorFeatures.get(authorId)[index] = Math.max(0, Number(link.value) || 1);
+        const fallbackLinkWeight = link.value == null ? 1 : 0;
+        authorFeatures.get(authorId)[index] += finiteNonnegative(
+          link.value,
+          fallbackLinkWeight
+        );
       }
     });
 
     // Every author participates, including zero-topic rows.
     const authorIds = [...authorFeatures.keys()];
     const rawVectors = authorIds.map(authorId => authorFeatures.get(authorId));
+    const rawLeadVectors = authorIds.map(authorId => authorLeadFeatures.get(authorId));
+    const rawRecentVectors = authorIds.map(authorId => authorRecentFeatures.get(authorId));
 
-    // Sublinear TF and author-level IDF preserve the existing topic weighting.
+    // Positive BM25 IDF gives genuinely rare topics more influence without the
+    // old hard cap. Empty profiles are not research documents and cannot change
+    // the corpus statistics, while each researcher with evidence counts once.
+    const idfProfiles = rawVectors.filter(profile => (
+      profile.some(value => value > 0)
+    ));
+    const idfDocumentCount = idfProfiles.length;
     const idfWeights = new Array(topicNames.length).fill(1);
     for (let featureIndex = 0; featureIndex < topicNames.length; featureIndex++) {
       let documentFrequency = 0;
-      for (let authorIndex = 0; authorIndex < rawVectors.length; authorIndex++) {
-        if (rawVectors[authorIndex][featureIndex] > 0) documentFrequency++;
+      for (let profileIndex = 0; profileIndex < idfProfiles.length; profileIndex++) {
+        if (idfProfiles[profileIndex][featureIndex] > 0) documentFrequency++;
       }
-      idfWeights[featureIndex] = Math.min(
-        3.5,
-        Math.log((rawVectors.length + 1) / (documentFrequency + 0.5)) + 1
+      idfWeights[featureIndex] = Math.log1p(
+        (idfDocumentCount - documentFrequency + 0.5)
+          / (documentFrequency + 0.5)
       );
     }
 
-    const directVectors = rawVectors.map(rawVector =>
-      rawVector.map((value, featureIndex) =>
-        value > 0 ? Math.log1p(value) * idfWeights[featureIndex] : 0
-      )
-    );
-    // Within each semantic centroid, down-weight low-support phrases relative
-    // to repeatedly observed topics. Visible topics have exact paper counts;
-    // hidden topics use the maximum per-author count as a conservative estimate.
-    const visibleTopicPaperFrequencies = new Map(keywordNodes.map(node => [
-      node.id,
-      Math.max(0, Number(node.paper_count ?? node.value) || 0)
-    ]));
-    const topicPaperFrequencies = new Array(topicNames.length).fill(0);
-    topicIds.forEach((topicId, featureIndex) => {
-      const visiblePaperFrequency = visibleTopicPaperFrequencies.get(topicId);
-      if (visiblePaperFrequency > 0) {
-        topicPaperFrequencies[featureIndex] = visiblePaperFrequency;
-        return;
-      }
-      rawVectors.forEach(rawVector => {
-        topicPaperFrequencies[featureIndex] = Math.max(
-          topicPaperFrequencies[featureIndex],
-          rawVector[featureIndex]
-        );
+    const bm25WeightProfiles = profiles => {
+      const profileLengths = profiles.map(profile => (
+        profile.reduce((sum, value) => sum + value, 0)
+      ));
+      const nonEmptyLengths = profileLengths.filter(length => length > 0);
+      const averageLength = nonEmptyLengths.length
+        ? nonEmptyLengths.reduce((sum, length) => sum + length, 0)
+          / nonEmptyLengths.length
+        : 1;
+
+      return profiles.map((profile, authorIndex) => {
+        // A single very prolific author should not erase their low-frequency
+        // topics. Cap only the length-normalization ratio, not the topic IDF.
+        const lengthRatio = Math.min(4, profileLengths[authorIndex] / averageLength);
+        const lengthPenalty = bm25K1 * (1 - bm25B + bm25B * lengthRatio);
+        return profile.map((value, featureIndex) => {
+          if (value <= 0) return 0;
+          const saturatedFrequency = value * (bm25K1 + 1) / (value + lengthPenalty);
+          return saturatedFrequency * idfWeights[featureIndex];
+        });
       });
-    });
-    const semanticSourceVectors = rawVectors.map(rawVector =>
+    };
+
+    const directVectors = bm25WeightProfiles(rawVectors);
+    const leadVectors = bm25WeightProfiles(rawLeadVectors);
+    const recentVectors = bm25WeightProfiles(rawRecentVectors);
+
+    // The semantic centroid uses the same author-specific evidence, but only a
+    // square-root IDF. This removes generic lab vocabulary without letting a
+    // one-off phrase or typo dominate an entire semantic direction.
+    const semanticSourceVectors = rawVectors.map((rawVector, authorIndex) =>
       rawVector.map((value, featureIndex) => {
         if (value <= 0) return 0;
-        const paperFrequency = topicPaperFrequencies[featureIndex];
-        const reliability = Math.sqrt(paperFrequency / (paperFrequency + 2));
-        return Math.log1p(value) * reliability;
+        const lengthWeightedValue = directVectors[authorIndex][featureIndex];
+        const temperedIdf = Math.sqrt(Math.max(idfWeights[featureIndex], 1e-12));
+        const repeatEvidence = Math.sqrt(
+          1 - Math.exp(-value / repeatEvidenceScale)
+        );
+        return lengthWeightedValue * repeatEvidence / temperedIdf;
       })
     );
     let vectors = directVectors;
@@ -1079,6 +1158,9 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     const latentTopicCoverage = latentTopicSpace && topicIds.length
       ? topicIds.filter(id => latentTopicSpace.vectorsById.has(id)).length / topicIds.length
       : 0;
+    const hasUsableLatentTopicSpace = Boolean(
+      latentTopicSpace && latentTopicCoverage >= 0.8
+    );
     const normalizeChannel = channel => {
       const magnitude = Math.sqrt(
         channel.reduce((sum, value) => sum + value * value, 0)
@@ -1089,26 +1171,88 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       return Array.from(channel, value => value / magnitude);
     };
 
-    if (latentTopicSpace && similarityAlpha > 0 && latentTopicCoverage >= 0.8) {
-      const directScale = Math.sqrt(1 - similarityAlpha);
-      const semanticScale = Math.sqrt(similarityAlpha);
+    const leadProfileCoverage = authorsWithLeadProfiles.size / Math.max(1, authorIds.length);
+    const recentProfileCoverage = authorsWithRecentProfiles.size
+      / Math.max(1, authorIds.length);
+    const leadChannelAvailable = leadProfileCoverage >= 0.8
+      && rawLeadVectors.some(vector => vector.some(value => value > 0));
+    const recentChannelAvailable = recentProfileCoverage >= 0.8
+      && rawRecentVectors.some(vector => vector.some(value => value > 0));
+    const requestedLeadAlpha = leadChannelAvailable ? configuredLeadAlpha : 0;
+    const requestedRecencyAlpha = recentChannelAvailable ? configuredRecencyAlpha : 0;
+    const requestedContextAlpha = requestedLeadAlpha + requestedRecencyAlpha;
+    const contextAlphaScale = requestedContextAlpha > 0.4
+      ? 0.4 / requestedContextAlpha
+      : 1;
+    const leadAlpha = requestedLeadAlpha * contextAlphaScale;
+    const recencyAlpha = requestedRecencyAlpha * contextAlphaScale;
+    const coreTopicAlpha = 1 - leadAlpha - recencyAlpha;
+
+    const combineResearchChannels = (
+      directVector,
+      semanticVector,
+      authorIndex,
+      semanticWeight
+    ) => {
+      // Scaling normalized, non-empty blocks by sqrt(weight) makes their
+      // squared energy match the configured 60/30/10 cosine contribution.
+      const boundedSemanticWeight = semanticVector
+        ? Math.max(0, Math.min(0.75, semanticWeight))
+        : 0;
+      const combined = normalizeChannel(directVector).map(
+        value => value * Math.sqrt(coreTopicAlpha * (1 - boundedSemanticWeight))
+      );
+      if (semanticVector) {
+        combined.push(...normalizeChannel(semanticVector).map(
+          value => value * Math.sqrt(coreTopicAlpha * boundedSemanticWeight)
+        ));
+      }
+      if (leadAlpha > 0) {
+        combined.push(...normalizeChannel(leadVectors[authorIndex]).map(
+          value => value * Math.sqrt(leadAlpha)
+        ));
+      }
+      if (recencyAlpha > 0) {
+        combined.push(...normalizeChannel(recentVectors[authorIndex]).map(
+          value => value * Math.sqrt(recencyAlpha)
+        ));
+      }
+      return combined;
+    };
+
+    // Topic-vector magnitudes are an SVD artifact. Normalize each row so a
+    // phrase contributes according to author evidence, not projection length.
+    const normalizedLatentVectorsById = new Map();
+    latentTopicSpace?.vectorsById.forEach((topicVector, topicId) => {
+      normalizedLatentVectorsById.set(topicId, normalizeChannel(topicVector));
+    });
+    vectors = directVectors.map((directVector, authorIndex) => (
+      combineResearchChannels(directVector, null, authorIndex, 0)
+    ));
+
+    if (hasUsableLatentTopicSpace && similarityAlpha > 0) {
       vectors = directVectors.map((directVector, authorIndex) => {
         const semanticVector = new Float64Array(latentTopicSpace.dimensions);
         semanticSourceVectors[authorIndex].forEach((value, featureIndex) => {
           if (!value) return;
-          const topicVector = latentTopicSpace.vectorsById.get(topicIds[featureIndex]);
+          const topicVector = normalizedLatentVectorsById.get(topicIds[featureIndex]);
           if (!topicVector) return;
           for (let axis = 0; axis < latentTopicSpace.dimensions; axis++) {
             semanticVector[axis] += value * topicVector[axis];
           }
         });
-        return normalizeChannel(directVector).map(value => value * directScale)
-          .concat(normalizeChannel(semanticVector).map(value => value * semanticScale));
+        return combineResearchChannels(
+          directVector,
+          semanticVector,
+          authorIndex,
+          similarityAlpha
+        );
       });
       semanticApplied = true;
       semanticMode = 'latent-topic-pca';
     } else if (
-      similarityPayload
+      !hasUsableLatentTopicSpace
+      && similarityPayload
       && neighborSimilarityAlpha > 0
       && visibleSimilarityCoverage >= 0.8
     ) {
@@ -1151,9 +1295,7 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       }).length / Math.max(1, visibleTopicIds.length);
 
       if (semanticNeighborCoverage > 0) {
-        const directScale = Math.sqrt(1 - neighborSimilarityAlpha);
-        const semanticScale = Math.sqrt(neighborSimilarityAlpha);
-        vectors = directVectors.map(directVector => {
+        vectors = directVectors.map((directVector, authorIndex) => {
           const semanticVector = directVector.slice();
           directVector.forEach((value, sourceIndex) => {
             if (!value || !semanticRows[sourceIndex].size) return;
@@ -1163,8 +1305,12 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
               semanticVector[targetIndex] += value * weight / rowTotal;
             });
           });
-          return normalizeChannel(directVector).map(value => value * directScale)
-            .concat(normalizeChannel(semanticVector).map(value => value * semanticScale));
+          return combineResearchChannels(
+            directVector,
+            semanticVector,
+            authorIndex,
+            neighborSimilarityAlpha
+          );
         });
         semanticApplied = true;
         semanticMode = 'neighbor-diffusion';
@@ -1174,26 +1320,72 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     const normalize = vector => {
       const magnitude = Math.sqrt(
         vector.reduce((sum, value) => sum + value * value, 0)
-      ) || 1;
+      );
+      if (!Number.isFinite(magnitude) || magnitude <= 1e-12) {
+        return vector.map(() => 0);
+      }
       return vector.map(value => value / magnitude);
     };
     vectors = vectors.map(normalize);
 
-    // Center every feature before extracting the three principal axes.
-    const semanticDimension = semanticMode === 'latent-topic-pca'
-      ? latentTopicSpace.dimensions
-      : semanticApplied ? topicNames.length : 0;
-    const vectorDimension = vectors[0]?.length
-      ?? topicNames.length + semanticDimension;
+    // Fit the shared axes once per distinct, non-empty research profile. This
+    // prevents a large coauthor list on one paper from counting the same topic
+    // vector many times while retaining unique single-paper research signals.
+    const vectorDimension = vectors[0]?.length || 0;
+    const vectorEnergy = vector => vector.reduce(
+      (sum, value) => sum + value * value,
+      0
+    );
+    const selectUniqueFitIndices = minimumPapers => {
+      const seenProfiles = new Set();
+      const indices = [];
+      vectors.forEach((vector, authorIndex) => {
+        const paperCount = finiteNonnegative(
+          orderedAuthors[authorIndex]?.paper_count
+        );
+        const energy = vectorEnergy(vector);
+        if (
+          paperCount < minimumPapers
+          || !Number.isFinite(energy)
+          || energy <= 1e-12
+        ) return;
+        const signature = JSON.stringify(vector);
+        if (seenProfiles.has(signature)) return;
+        seenProfiles.add(signature);
+        indices.push(authorIndex);
+      });
+      return indices;
+    };
+    let fitAuthorIndices = selectUniqueFitIndices(pcaMinimumPapers);
+    if (fitAuthorIndices.length < 4 && pcaMinimumPapers > 1) {
+      fitAuthorIndices = selectUniqueFitIndices(1);
+    }
+    const fitVectors = fitAuthorIndices.map(authorIndex => vectors[authorIndex]);
+    const requestedReferenceIndex = referenceAuthorId
+      ? authorIds.indexOf(referenceAuthorId)
+      : -1;
+    const requestedReferenceEnergy = requestedReferenceIndex >= 0
+      ? vectorEnergy(vectors[requestedReferenceIndex])
+      : 0;
+    const referenceApplied = requestedReferenceIndex >= 0
+      && Number.isFinite(requestedReferenceEnergy)
+      && requestedReferenceEnergy > 1e-12;
+    const activeReferenceIndex = referenceApplied ? requestedReferenceIndex : -1;
+    const activeReferenceAuthorId = referenceApplied ? referenceAuthorId : null;
+
+    // Keep the globally fitted PCA axes so pairwise projected differences remain
+    // intact. The reference is applied after projection as a coordinate shift
+    // and as a whiteness anchor; using it as an uncentered PCA origin would spend
+    // the leading component on professor-vs-cohort separation.
     const featureMeans = new Float64Array(vectorDimension);
-    vectors.forEach(vector => {
+    fitVectors.forEach(vector => {
       for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
         featureMeans[featureIndex] += vector[featureIndex];
       }
     });
-    if (vectors.length) {
+    if (fitVectors.length) {
       for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
-        featureMeans[featureIndex] /= vectors.length;
+        featureMeans[featureIndex] /= fitVectors.length;
       }
     }
 
@@ -1204,10 +1396,13 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       }
       return centered;
     });
+    const fitCenteredRows = fitAuthorIndices.map(authorIndex => (
+      centeredRows[authorIndex]
+    ));
 
     // Work in author space (X X^T). This is the deterministic dual form of the
     // NIPALS power step and avoids constructing a much larger feature covariance.
-    const sampleCount = centeredRows.length;
+    const sampleCount = fitCenteredRows.length;
     const gram = Array.from(
       { length: sampleCount },
       () => new Float64Array(sampleCount)
@@ -1217,8 +1412,8 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       for (let otherIndex = 0; otherIndex <= rowIndex; otherIndex++) {
         let value = 0;
         for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
-          value += centeredRows[rowIndex][featureIndex]
-            * centeredRows[otherIndex][featureIndex];
+          value += fitCenteredRows[rowIndex][featureIndex]
+            * fitCenteredRows[otherIndex][featureIndex];
         }
         gram[rowIndex][otherIndex] = value;
         gram[otherIndex][rowIndex] = value;
@@ -1226,7 +1421,7 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       totalCenteredSumSquares += gram[rowIndex][rowIndex];
     }
 
-    const rawScores = Array.from({ length: sampleCount }, () => [0, 0, 0]);
+    const rawScores = Array.from({ length: vectors.length }, () => [0, 0, 0]);
     const explainedVariance = [0, 0, 0];
     const componentVectors = [];
     const varianceDenominator = Math.max(1, sampleCount - 1);
@@ -1272,7 +1467,7 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       const candidate = new Float64Array(sampleCount);
       for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
         for (let authorIndex = 0; authorIndex < sampleCount; authorIndex++) {
-          candidate[authorIndex] = centeredRows[authorIndex][featureIndex];
+          candidate[authorIndex] = fitCenteredRows[authorIndex][featureIndex];
         }
         removePreviousComponents(candidate);
         let energy = 0;
@@ -1336,7 +1531,8 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
         let value = 0;
         for (let authorIndex = 0; authorIndex < sampleCount; authorIndex++) {
-          value += centeredRows[authorIndex][featureIndex] * eigenvector[authorIndex];
+          value += fitCenteredRows[authorIndex][featureIndex]
+            * eigenvector[authorIndex];
         }
         loading[featureIndex] = value / singularValue;
       }
@@ -1361,15 +1557,17 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
         }
       }
 
-      let scoreEnergy = 0;
-      for (let authorIndex = 0; authorIndex < sampleCount; authorIndex++) {
+      for (let authorIndex = 0; authorIndex < vectors.length; authorIndex++) {
         let score = 0;
         for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
           score += centeredRows[authorIndex][featureIndex] * loading[featureIndex];
         }
         rawScores[authorIndex][componentIndex] = score;
-        scoreEnergy += score * score;
       }
+      const scoreEnergy = fitAuthorIndices.reduce((sum, authorIndex) => (
+        sum + rawScores[authorIndex][componentIndex]
+          * rawScores[authorIndex][componentIndex]
+      ), 0);
       if (scoreEnergy <= varianceFloor || !Number.isFinite(scoreEnergy)) break;
 
       componentVectors.push(eigenvector);
@@ -1379,51 +1577,56 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     // Stretch each PCA axis into an 8-bit channel. A soft percentile blend
     // expands dense score regions without discarding the original PCA distance
     // or assigning different colors to identical research profiles.
-    const rgbRows = Array.from({ length: sampleCount }, () => [128, 128, 128]);
+    const baseRgbRows = Array.from(
+      { length: vectors.length },
+      () => [128, 128, 128]
+    );
     const scoreRanges = [];
     const colorPercentileWeight = 0.65;
-    for (let axis = 0; axis < 3; axis++) {
-      let minimum = Infinity;
-      let maximum = -Infinity;
-      rawScores.forEach(scores => {
-        minimum = Math.min(minimum, scores[axis]);
-        maximum = Math.max(maximum, scores[axis]);
-      });
-      if (!sampleCount) {
-        minimum = 0;
-        maximum = 0;
+    const hasResearchEvidence = vectors.map(vector => {
+      const energy = vectorEnergy(vector);
+      return Number.isFinite(energy) && energy > 1e-12;
+    });
+    const colorReferenceIndices = fitAuthorIndices.length
+      ? fitAuthorIndices
+      : hasResearchEvidence.flatMap((hasEvidence, index) => hasEvidence ? [index] : []);
+    const percentileOfSortedValues = (sortedValues, value) => {
+      let lower = 0;
+      let upper = sortedValues.length;
+      while (lower < upper) {
+        const middle = Math.floor((lower + upper) / 2);
+        if (sortedValues[middle] < value) lower = middle + 1;
+        else upper = middle;
       }
+      const first = lower;
+      upper = sortedValues.length;
+      while (lower < upper) {
+        const middle = Math.floor((lower + upper) / 2);
+        if (sortedValues[middle] <= value) lower = middle + 1;
+        else upper = middle;
+      }
+      const lastExclusive = lower;
+      const rank = lastExclusive > first
+        ? (first + lastExclusive - 1) / 2
+        : first - 0.5;
+      return sortedValues.length > 1
+        ? Math.max(0, Math.min(1, rank / (sortedValues.length - 1)))
+        : 0.5;
+    };
+    for (let axis = 0; axis < 3; axis++) {
+      const referenceValues = colorReferenceIndices
+        .map(authorIndex => rawScores[authorIndex][axis])
+        .sort((a, b) => a - b);
+      const minimum = referenceValues[0] ?? 0;
+      const maximum = referenceValues[referenceValues.length - 1] ?? 0;
       scoreRanges.push([minimum, maximum]);
       const range = maximum - minimum;
       const degenerate = !Number.isFinite(range)
         || range <= Math.max(1, Math.abs(minimum), Math.abs(maximum)) * 1e-12;
 
-      const rankedScores = rawScores
-        .map((scores, authorIndex) => ({
-          authorIndex,
-          value: scores[axis]
-        }))
-        .sort((a, b) => a.value - b.value || a.authorIndex - b.authorIndex);
-      const percentileByAuthor = new Float64Array(sampleCount);
-      for (let rankStart = 0; rankStart < rankedScores.length;) {
-        let rankEnd = rankStart + 1;
-        while (
-          rankEnd < rankedScores.length
-          && rankedScores[rankEnd].value === rankedScores[rankStart].value
-        ) {
-          rankEnd++;
-        }
-        const midRank = (rankStart + rankEnd - 1) / 2;
-        const percentile = sampleCount > 1 ? midRank / (sampleCount - 1) : 0.5;
-        for (let rankIndex = rankStart; rankIndex < rankEnd; rankIndex++) {
-          percentileByAuthor[rankedScores[rankIndex].authorIndex] = percentile;
-        }
-        rankStart = rankEnd;
-      }
-
       rawScores.forEach((scores, authorIndex) => {
-        if (degenerate) {
-          rgbRows[authorIndex][axis] = 128;
+        if (degenerate || !hasResearchEvidence[authorIndex]) {
+          baseRgbRows[authorIndex][axis] = 128;
           return;
         }
         const linearPosition = Math.max(
@@ -1431,28 +1634,219 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
           Math.min(1, (scores[axis] - minimum) / range)
         );
         const colorPosition = linearPosition * (1 - colorPercentileWeight)
-          + percentileByAuthor[authorIndex] * colorPercentileWeight;
-        rgbRows[authorIndex][axis] = Math.max(
+          + percentileOfSortedValues(referenceValues, scores[axis])
+            * colorPercentileWeight;
+        baseRgbRows[authorIndex][axis] = Math.max(
           0,
           Math.min(255, Math.round(colorPosition * 255))
         );
       });
     }
 
+    // Turn the reference-relative research vector into a perceptual color.
+    // Full-space cosine distance controls the radius away from white. The first
+    // two relative PCA axes control hue, while the third changes chroma. This
+    // keeps the professor structurally at white without folding PCA signs or
+    // letting an unrelated base-color brightness fake reference proximity.
+    const referenceVector = referenceApplied
+      ? vectors[activeReferenceIndex]
+      : null;
+    const referencePcaScores = referenceApplied
+      ? rawScores[activeReferenceIndex].slice()
+      : [0, 0, 0];
+    const relativeScores = rawScores.map(scores => scores.map(
+      (score, axis) => score - referencePcaScores[axis]
+    ));
+    const referenceSimilarities = new Array(vectors.length).fill(null);
+    const referenceDistances = new Array(vectors.length).fill(null);
+    if (referenceVector) {
+      vectors.forEach((vector, authorIndex) => {
+        if (!hasResearchEvidence[authorIndex]) return;
+        let dotProduct = 0;
+        for (let featureIndex = 0; featureIndex < vectorDimension; featureIndex++) {
+          dotProduct += vector[featureIndex] * referenceVector[featureIndex];
+        }
+        const similarity = authorIndex === activeReferenceIndex
+          ? 1
+          : Math.max(-1, Math.min(1, dotProduct));
+        referenceSimilarities[authorIndex] = similarity;
+        referenceDistances[authorIndex] = Math.sqrt(
+          Math.max(0, (1 - similarity) / 2)
+        );
+      });
+    }
+
+    const referenceDistanceValues = referenceVector
+      ? colorReferenceIndices
+        .map(authorIndex => referenceDistances[authorIndex])
+        .filter(distance => Number.isFinite(distance))
+        .sort((a, b) => a - b)
+      : [];
+    const maximumReferenceDistance = referenceDistanceValues[
+      referenceDistanceValues.length - 1
+    ] || 0;
+    const referenceDistancePercentileWeight = 0.65;
+    const referenceRadialPositions = referenceDistances.map(distance => {
+      if (!Number.isFinite(distance)) return null;
+      if (distance <= 1e-12 || maximumReferenceDistance <= 1e-12) return 0;
+      const linearPosition = Math.max(
+        0,
+        Math.min(1, distance / maximumReferenceDistance)
+      );
+      return linearPosition * (1 - referenceDistancePercentileWeight)
+        + percentileOfSortedValues(referenceDistanceValues, distance)
+          * referenceDistancePercentileWeight;
+    });
+    const relativeScoreScales = [0, 1, 2].map(axis => {
+      const meanSquare = colorReferenceIndices.length
+        ? colorReferenceIndices.reduce((sum, authorIndex) => (
+          sum + relativeScores[authorIndex][axis]
+            * relativeScores[authorIndex][axis]
+        ), 0) / colorReferenceIndices.length
+        : 0;
+      const scale = Math.sqrt(meanSquare);
+      return Number.isFinite(scale) && scale > 1e-12 ? scale : 1;
+    });
+
+    const oklabToLinearSrgb = (lightness, channelA, channelB) => {
+      const longL = lightness
+        + 0.3963377774 * channelA
+        + 0.2158037573 * channelB;
+      const longM = lightness
+        - 0.1055613458 * channelA
+        - 0.0638541728 * channelB;
+      const longS = lightness
+        - 0.0894841775 * channelA
+        - 1.291485548 * channelB;
+      const linearL = longL * longL * longL;
+      const linearM = longM * longM * longM;
+      const linearS = longS * longS * longS;
+      return [
+        4.0767416621 * linearL
+          - 3.3077115913 * linearM
+          + 0.2309699292 * linearS,
+        -1.2684380046 * linearL
+          + 2.6097574011 * linearM
+          - 0.3413193965 * linearS,
+        -0.0041960863 * linearL
+          - 0.7034186147 * linearM
+          + 1.707614701 * linearS
+      ];
+    };
+    const encodeSrgbChannel = channel => {
+      const bounded = Math.max(0, Math.min(1, channel));
+      const encoded = bounded <= 0.0031308
+        ? 12.92 * bounded
+        : 1.055 * bounded ** (1 / 2.4) - 0.055;
+      return Math.round(encoded * 255);
+    };
+    const oklabToRgb = (lightness, channelA, channelB) => {
+      const inGamut = channels => channels.every(
+        channel => Number.isFinite(channel) && channel >= 0 && channel <= 1
+      );
+      let linearRgb = oklabToLinearSrgb(lightness, channelA, channelB);
+      if (!inGamut(linearRgb)) {
+        // Reduce only chroma, retaining the distance-derived lightness.
+        let lowerScale = 0;
+        let upperScale = 1;
+        for (let iteration = 0; iteration < 16; iteration++) {
+          const middleScale = (lowerScale + upperScale) / 2;
+          const candidate = oklabToLinearSrgb(
+            lightness,
+            channelA * middleScale,
+            channelB * middleScale
+          );
+          if (inGamut(candidate)) lowerScale = middleScale;
+          else upperScale = middleScale;
+        }
+        linearRgb = oklabToLinearSrgb(
+          lightness,
+          channelA * lowerScale,
+          channelB * lowerScale
+        );
+      }
+      return linearRgb.map(encodeSrgbChannel);
+    };
+
+    const referenceLightnessDrop = 0.5;
+    const referenceMinimumChroma = 0.12;
+    const referenceElevationChroma = 0.16;
+    // PCA axis signs are stable but their absolute hue has no semantic label.
+    // Rotate the whole palette together into a broad, low-clipping gamut region.
+    const referenceHueRotation = 11 * Math.PI / 12;
+    const rgbRows = baseRgbRows.map((baseRgb, authorIndex) => {
+      if (!referenceVector || !hasResearchEvidence[authorIndex]) {
+        return baseRgb.slice();
+      }
+      const radialPosition = referenceRadialPositions[authorIndex];
+      if (!Number.isFinite(radialPosition) || radialPosition <= 1e-12) {
+        return [255, 255, 255];
+      }
+      const scaledScores = relativeScores[authorIndex].map(
+        (score, axis) => score / relativeScoreScales[axis]
+      );
+      const directionMagnitude = Math.sqrt(
+        scaledScores.reduce((sum, score) => sum + score * score, 0)
+      );
+      const hasProjectedDirection = Number.isFinite(directionMagnitude)
+        && directionMagnitude > 1e-12;
+      const unitScores = hasProjectedDirection
+        ? scaledScores.map(score => score / directionMagnitude)
+        : [0, 0, 0];
+      const hue = hasProjectedDirection
+        ? Math.atan2(unitScores[1], unitScores[0]) + referenceHueRotation
+        : 0;
+      const chroma = hasProjectedDirection
+        ? radialPosition * (
+          referenceMinimumChroma
+            + referenceElevationChroma * (unitScores[2] + 1) / 2
+        )
+        : 0;
+      const lightness = 1 - referenceLightnessDrop * radialPosition;
+      return oklabToRgb(
+        lightness,
+        chroma * Math.cos(hue),
+        chroma * Math.sin(hue)
+      );
+    });
+
     const result = new Map();
     const rgbById = new Map();
+    const baseRgbById = new Map();
     const scoresById = new Map();
+    const referenceSimilarityById = new Map();
+    const referenceDistanceById = new Map();
+    const referenceRadialPositionById = new Map();
     const authorNodeById = new Map(orderedAuthors.map(author => [author.id, author]));
     authorIds.forEach((authorId, authorIndex) => {
       const rgb = rgbRows[authorIndex].slice();
-      const scores = rawScores[authorIndex].slice();
+      const baseRgb = baseRgbRows[authorIndex].slice();
+      const scores = relativeScores[authorIndex].slice();
       const color = 'rgb(' + rgb.join(', ') + ')';
       result.set(authorId, color);
       rgbById.set(authorId, rgb);
+      baseRgbById.set(authorId, baseRgb);
       scoresById.set(authorId, scores);
+      referenceSimilarityById.set(
+        authorId,
+        referenceSimilarities[authorIndex]
+      );
+      referenceDistanceById.set(
+        authorId,
+        referenceDistances[authorIndex]
+      );
+      referenceRadialPositionById.set(
+        authorId,
+        referenceRadialPositions[authorIndex]
+      );
 
       const authorNode = authorNodeById.get(authorId);
       if (authorNode) {
+        const paperCount = finiteNonnegative(authorNode.paper_count);
+        authorNode.researchEvidence = hasResearchEvidence[authorIndex];
+        authorNode.researchConfidence = hasResearchEvidence[authorIndex]
+          ? paperCount / (paperCount + 1)
+          : 0;
         authorNode.pcaRgb = rgb.slice();
         authorNode.pcaScores = scores.slice();
         authorNode.pcaColor = color;
@@ -1475,17 +1869,47 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
     result.meta = {
       authorIds: authorIds.slice(),
       rgbById,
+      baseRgbById,
       scoresById,
+      relativeScores: relativeScores.map(scores => scores.slice()),
       rawScores: rawScores.map(scores => scores.slice()),
       explainedVariance,
       explainedVarianceRatio,
       totalVariance,
       activeComponents: componentVectors.length,
       scoreRanges,
-      colorMapping: 'minmax-percentile-blend',
+      colorMapping: referenceApplied
+        ? 'reference-polar-oklab-v1'
+        : 'unique-profile-minmax-percentile-blend',
       colorPercentileWeight,
+      referenceAuthorId: activeReferenceAuthorId,
+      referenceApplied,
+      referencePcaScores,
+      referenceRgb: referenceApplied ? [255, 255, 255] : null,
+      referenceSimilarityById,
+      referenceDistanceById,
+      referenceRadialPositionById,
+      referenceDistancePercentileWeight,
+      referenceLightnessDrop,
+      referenceMinimumChroma,
+      referenceElevationChroma,
+      referenceHueRotation,
+      relativeScoreScales,
       topicCount: topicNames.length,
       vectorDimension,
+      vectorizerScheme: 'bm25-multiview-v1',
+      bm25K1,
+      bm25B,
+      repeatEvidenceScale,
+      leadAlpha,
+      recencyAlpha,
+      coreTopicAlpha,
+      leadProfileCoverage,
+      recentProfileCoverage,
+      pcaMinimumPapers,
+      pcaFitProfileCount: fitAuthorIndices.length,
+      evidenceAuthorCount: hasResearchEvidence.filter(Boolean).length,
+      unknownResearchIds: authorIds.filter((id, index) => !hasResearchEvidence[index]),
       semanticApplied,
       semanticMode,
       similarityAlpha,
@@ -1622,9 +2046,6 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       if (n.type === 'keyword') {
         return '#f1f0ec';
       }
-      if (n.id === COLLABO_FEATURED_AUTHOR_ID) {
-        return COLLABO_FEATURED_AUTHOR_COLOR;
-      }
       return authorColors.get(n.id) || 'rgb(128, 128, 128)';
     };
 
@@ -1673,30 +2094,22 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
       || !similarityVocabularyHash
       || graphVocabularyHash === similarityVocabularyHash;
     if (!similarityVocabularyMatches) {
-      console.warn('Collaboration PCA skipped stale keyword similarities.');
+      console.warn(
+        'Collaboration PCA is using the covered subset of stale keyword similarities.'
+      );
     }
 
     const authorColors = createPcaAuthorColors(
       authorNodes,
       keywordNodes,
       data.links,
-      similarityVocabularyMatches ? keywordSimData : null
+      keywordSimData,
+      COLLABO_RESEARCH_REFERENCE_AUTHOR_ID
     );
     const pcaRgbById = authorColors.meta?.rgbById || new Map();
-    // Preserve the analytical PCA colors for links. If the featured white
-    // presentation color participates in screen blending, every hub spoke
-    // becomes white and washes out the surrounding colors.
-    const additiveLinkRgbById = new Map(
-      [...pcaRgbById].map(([id, rgb]) => [id, Array.from(rgb)])
-    );
-    const featuredAuthor = authorNodes.find(node => node.id === COLLABO_FEATURED_AUTHOR_ID);
-    if (featuredAuthor) {
-      const featuredRgb = COLLABO_FEATURED_AUTHOR_RGB.slice();
-      authorColors.set(COLLABO_FEATURED_AUTHOR_ID, COLLABO_FEATURED_AUTHOR_COLOR);
-      pcaRgbById.set(COLLABO_FEATURED_AUTHOR_ID, featuredRgb);
-      featuredAuthor.pcaRgb = featuredRgb.slice();
-      featuredAuthor.pcaColor = COLLABO_FEATURED_AUTHOR_COLOR;
-    }
+    // Link blending uses the global base PCA hue. Feeding the white reference
+    // into screen blending would turn every professor spoke white.
+    const additiveLinkRgbById = authorColors.meta?.baseRgbById || pcaRgbById;
     const getAdditiveLinkColor = link => {
       const sourceRgb = additiveLinkRgbById.get(getLinkEndpointId(link.source));
       const targetRgb = additiveLinkRgbById.get(getLinkEndpointId(link.target));
@@ -1747,7 +2160,11 @@ const COLLABO_FEATURED_AUTHOR_RGB = [255, 255, 255];
         const photoMarkup = photo ? `<img class="collabo-node-photo-img" src="${photo}" alt="${escapedName}" loading="lazy"/>` : '';
         const authorColor = getNodeBaseColor(n);
         const pcaRgb = pcaRgbById.get(n.id) || [128, 128, 128];
-        const researchColorLabel = `Research Color · RGB(${pcaRgb.join(', ')})`;
+        const isResearchReference = authorColors.meta?.referenceApplied
+          && n.id === authorColors.meta.referenceAuthorId;
+        const researchColorLabel = isResearchReference
+          ? `Research Reference · RGB(${pcaRgb.join(', ')})`
+          : `Research Color · RGB(${pcaRgb.join(', ')})`;
         const topicMarkup = (n.top_keywords || [])
           .slice(0, 3)
           .map(topic => `<span class="collabo-topic-chip">${htmlEscape(topic.name)}</span>`)

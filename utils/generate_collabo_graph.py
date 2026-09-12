@@ -3,6 +3,7 @@ import itertools
 import json
 import math
 import re
+import unicodedata
 from collections import Counter, defaultdict
 
 import bibtexparser
@@ -20,6 +21,8 @@ author_collaborative_counter = Counter()
 author_coauthors = defaultdict(set)
 author_years = defaultdict(list)
 author_keywords = defaultdict(Counter)
+author_lead_keywords = defaultdict(Counter)
+author_keyword_years = defaultdict(list)
 coauthor_counter = defaultdict(int)
 keyword_counter = Counter()
 keyword_authors = defaultdict(set)
@@ -28,7 +31,21 @@ author_keyword_papers = defaultdict(int)
 
 FIRST_AUTHOR_WEIGHT = 3
 OTHER_AUTHOR_WEIGHT = 1
+RECENCY_HALF_LIFE_YEARS = 6
 KEYWORD_DISPLAY_BY_KEY = {}
+# Only merge variants that are unambiguously the same research concept. Broader
+# semantic relationships remain separate and are handled by the embedding channel.
+KEYWORD_ALIAS_DISPLAY = {
+    "automated guided vehicle": "Automated Guided Vehicle",
+    "automated guided vehicles": "Automated Guided Vehicle",
+    "convolutional neural network": "Convolutional Neural Network",
+    "convolutional neural networks": "Convolutional Neural Network",
+    "data driven decision making": "Data-driven decision making",
+    "large language model": "Large Language Model",
+    "large language models": "Large Language Model",
+    "maritime accident": "Maritime Accident",
+    "maritime accidents": "Maritime Accident",
+}
 AUTHOR_ALIASES = {
     # Explicit aliases are safer than fuzzy merging people with similar names.
     "Changdong Lee": "Lee, Changdong",
@@ -44,11 +61,17 @@ def normalize_author(author):
 
 
 def normalize_keyword(kw):
-    """Normalize whitespace and merge case-only spelling variants."""
-    display = re.sub(r'\s+', ' ', kw.strip())
-    canonical_key = display.casefold()
+    """Normalize typography and merge only high-confidence spelling variants."""
+    display = unicodedata.normalize("NFKC", kw).strip()
+    display = re.sub(r"[\u2010-\u2015\u2212]", "-", display)
+    display = re.sub(r"\s+", " ", display)
+    canonical_key = re.sub(r"[-\s]+", " ", display.casefold()).strip(" .,:;")
+    preferred_display = KEYWORD_ALIAS_DISPLAY.get(canonical_key, display)
+    canonical_key = re.sub(
+        r"[-\s]+", " ", preferred_display.casefold()
+    ).strip(" .,:;")
     if canonical_key not in KEYWORD_DISPLAY_BY_KEY:
-        KEYWORD_DISPLAY_BY_KEY[canonical_key] = display
+        KEYWORD_DISPLAY_BY_KEY[canonical_key] = preferred_display
     return KEYWORD_DISPLAY_BY_KEY[canonical_key]
 
 
@@ -131,7 +154,23 @@ for entry in bib_database.entries:
                 author_keyword_links[(author, kw)] += weight
                 author_keyword_papers[(author, kw)] += 1
                 author_keywords[author][kw] += 1
+                author_keyword_years[(author, kw)].append(publication_year)
+                if author == authors[0]:
+                    author_lead_keywords[author][kw] += 1
                 keyword_authors[kw].add(author)
+
+publication_years = [year for years in author_years.values() for year in years]
+research_reference_year = max(publication_years) if publication_years else None
+
+
+def recency_weight(year):
+    """Exponential time decay anchored to the newest paper in the dataset."""
+    if year is None:
+        return 0.0
+    if research_reference_year is None:
+        return 1.0
+    age = max(0, research_reference_year - year)
+    return 2 ** (-age / RECENCY_HALF_LIFE_YEARS)
 
 # Filter keywords: only include those that appear in at least 2 papers
 MIN_KEYWORD_COUNT = 2
@@ -151,6 +190,18 @@ for author in author_counter:
         # Topic clustering should describe subject frequency, not authorship order.
         # First-author weighting remains available separately through `value`.
         keyword: author_keyword_papers[(author, keyword)] for keyword in topic_counts
+    }
+    lead_topic_profile = {
+        keyword: count
+        for keyword, count in author_lead_keywords[author].items()
+        if count > 0
+    }
+    recent_topic_profile = {
+        keyword: round(
+            sum(recency_weight(year) for year in author_keyword_years[(author, keyword)]),
+            6,
+        )
+        for keyword in topic_counts
     }
     top_keywords = [
         {"name": keyword, "count": count}
@@ -190,6 +241,8 @@ for author in author_counter:
             "topic_count": len(topic_counts),
             "topic_diversity": normalized_topic_diversity(topic_counts),
             "topic_profile": topic_profile,
+            "lead_topic_profile": lead_topic_profile,
+            "recent_topic_profile": recent_topic_profile,
             "top_keywords": top_keywords,
             "active_from": min(years) if years else None,
             "active_to": max(years) if years else None,
@@ -232,7 +285,9 @@ author_kw_links = [
 # Combine all nodes and links
 nodes = author_nodes + keyword_nodes
 links = coauthor_links + author_kw_links
-topic_vocabulary = sorted(keyword_counter, key=str.casefold)
+# Hash an explicitly specified bytewise ordering. Python's casefold and
+# JavaScript's toLowerCase are not equivalent for every Unicode character.
+topic_vocabulary = sorted(keyword_counter, key=lambda value: value.encode("utf-8"))
 topic_vocabulary_hash = hashlib.sha256(
     "\n".join(topic_vocabulary).encode("utf-8")
 ).hexdigest()[:16]
@@ -246,13 +301,17 @@ with open('assets/json/collabo_graph.json', 'w', encoding='utf-8') as f:
     json.dump(
         {
             "meta": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "author_value": "weighted_authorship",
                 "first_author_weight": FIRST_AUTHOR_WEIGHT,
                 "other_author_weight": OTHER_AUTHOR_WEIGHT,
                 "minimum_keyword_papers": MIN_KEYWORD_COUNT,
                 "topic_vocabulary_size": len(topic_vocabulary),
                 "topic_vocabulary_hash": topic_vocabulary_hash,
+                "topic_vocabulary_order": "utf8-bytewise-v1",
+                "research_profile": "topic-counts+lead+recency",
+                "research_reference_year": research_reference_year,
+                "research_recency_half_life_years": RECENCY_HALF_LIFE_YEARS,
             },
             "nodes": nodes,
             "links": links,

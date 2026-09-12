@@ -51,7 +51,18 @@ ninja.data = [{
           handler: () => {
             window.location.href = "/cv/";
           },
-        },{id: "post-通义千问-qwen-의-全球-人工智能-霸权-战略-및-技术-生态系-分析",
+        },{id: "post-online-learning",
+        
+          title: 'Online-Learning <svg width="1.2rem" height="1.2rem" top=".5rem" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg"><path d="M17 13.5v6H5v-12h6m3-3h6v6m0-6-9 9" class="icon_svg-stroke" stroke="#999" stroke-width="1.5" fill="none" fill-rule="evenodd" stroke-linecap="round" stroke-linejoin="round"></path></svg>',
+        
+        description: "",
+        section: "Posts",
+        handler: () => {
+          
+            window.open("https://thrillcrazyer.github.io/blog/2026/online-learning/", "_blank");
+          
+        },
+      },{id: "post-通义千问-qwen-의-全球-人工智能-霸权-战略-및-技术-生态系-分析",
         
           title: "通义千问(Qwen)의 全球 人工智能 霸权 战略 및 技术 生态系 分析",
         
