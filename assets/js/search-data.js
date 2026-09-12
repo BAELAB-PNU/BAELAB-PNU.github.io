@@ -1490,6 +1490,11 @@ ninja.data = [{
           description: "ASPAI2026, POHANG, KOREA",
           section: "Photo",handler: () => {
               window.location.href = "/photo/2026ASPAI2/";
+            },},{id: "photo-kds-컨퍼런스-amp-헤커톤",
+          title: 'KDS 컨퍼런스&amp;amp;헤커톤',
+          description: "KDS 컨퍼런스&amp;헤커톤, DAEGU, Korea",
+          section: "Photo",handler: () => {
+              window.location.href = "/photo/2026KDS%ED%95%99%ED%9A%8C/";
             },},{id: "projects-",
           title: '',
           description: "센서 인식 기술을 활용한 AGV 트랜스폰더 예지보전 기술 개발",
