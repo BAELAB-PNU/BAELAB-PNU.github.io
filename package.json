@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test:research-vectors": "node utils/validate_research_vectors.cjs"
+  },
   "devDependencies": {
     "@shopify/prettier-plugin-liquid": "1.4.0",
     "prettier": "3.1.1"

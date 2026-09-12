@@ -201,7 +201,7 @@ def main() -> int:
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.6,
+        default=0.35,
         help=(
             "Semantic latent-channel weight consumed by collabo.liquid "
             "(clamped there for safety)"
@@ -210,7 +210,7 @@ def main() -> int:
     parser.add_argument(
         "--neighbor-alpha",
         type=float,
-        default=0.3,
+        default=0.25,
         help=(
             "Fallback sparse-neighbor channel weight when latent vectors "
             "are unavailable"
@@ -221,6 +221,42 @@ def main() -> int:
         type=int,
         default=64,
         help="Number of semantic keyword dimensions stored for browser-side PCA",
+    )
+    parser.add_argument(
+        "--bm25-k1",
+        type=float,
+        default=1.35,
+        help="BM25 term-frequency saturation parameter for author topic profiles",
+    )
+    parser.add_argument(
+        "--bm25-b",
+        type=float,
+        default=0.35,
+        help="BM25 author-profile length normalization strength",
+    )
+    parser.add_argument(
+        "--repeat-evidence-scale",
+        type=float,
+        default=1.5,
+        help="Scale used to soften one-off topics in the semantic centroid",
+    )
+    parser.add_argument(
+        "--lead-alpha",
+        type=float,
+        default=0.3,
+        help="Weight reserved for topics from first-author papers",
+    )
+    parser.add_argument(
+        "--recency-alpha",
+        type=float,
+        default=0.1,
+        help="Weight reserved for the time-decayed recent-topic profile",
+    )
+    parser.add_argument(
+        "--pca-min-papers",
+        type=int,
+        default=1,
+        help="Minimum author paper count used to fit the shared PCA axes",
     )
     parser.add_argument(
         "--fallback",
@@ -240,6 +276,20 @@ def main() -> int:
         parser.error("--neighbor-alpha must be between 0 and 0.5")
     if not 1 <= args.latent_dimensions <= 1024:
         parser.error("--latent-dimensions must be between 1 and 1024")
+    if not 0.1 <= args.bm25_k1 <= 3:
+        parser.error("--bm25-k1 must be between 0.1 and 3")
+    if not 0 <= args.bm25_b <= 1:
+        parser.error("--bm25-b must be between 0 and 1")
+    if not 0.25 <= args.repeat_evidence_scale <= 10:
+        parser.error("--repeat-evidence-scale must be between 0.25 and 10")
+    if not 0 <= args.lead_alpha <= 0.3:
+        parser.error("--lead-alpha must be between 0 and 0.3")
+    if not 0 <= args.recency_alpha <= 0.25:
+        parser.error("--recency-alpha must be between 0 and 0.25")
+    if args.lead_alpha + args.recency_alpha > 0.4:
+        parser.error("--lead-alpha + --recency-alpha must not exceed 0.4")
+    if not 1 <= args.pca_min_papers <= 20:
+        parser.error("--pca-min-papers must be between 1 and 20")
 
     graph_path = Path(args.graph)
     out_path = Path(args.out)
@@ -276,20 +326,34 @@ def main() -> int:
         if embeddings is not None
         else None
     )
+    ordered_vocabulary = sorted(
+        (name for _, name in keywords),
+        key=lambda value: value.encode("utf-8"),
+    )
     vocabulary_hash = hashlib.sha256(
-        "\n".join(sorted((name for _, name in keywords), key=str.casefold)).encode("utf-8")
+        "\n".join(ordered_vocabulary).encode("utf-8")
     ).hexdigest()[:16]
 
     payload = {
-        "version": 3,
+        "version": 4,
         "backend": used_backend,
         "model": None if used_backend != "sentence-transformers" else args.model,
         "threshold": args.threshold,
         "topk": args.topk,
         "alpha": args.alpha,
         "neighbor_alpha": args.neighbor_alpha,
+        "vectorizer": {
+            "scheme": "bm25-multiview-v1",
+            "bm25_k1": args.bm25_k1,
+            "bm25_b": args.bm25_b,
+            "repeat_evidence_scale": args.repeat_evidence_scale,
+            "lead_alpha": args.lead_alpha,
+            "recency_alpha": args.recency_alpha,
+            "pca_min_papers": args.pca_min_papers,
+        },
         "vocabulary_size": len(keyword_ids),
         "vocabulary_hash": vocabulary_hash,
+        "vocabulary_order": "utf8-bytewise-v1",
         "similarities": sim_map,
     }
     if topic_vectors is not None:

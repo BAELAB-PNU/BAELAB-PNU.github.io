@@ -12,6 +12,7 @@ on:
       - "**.bib"
       - "**.html"
       - "**.js"
+      - "**.cjs"
       - "**.liquid"
       - "**/*.md"
       - "**.yml"
@@ -41,6 +42,7 @@ on:
       - "**.bib"
       - "**.html"
       - "**.js"
+      - "**.cjs"
       - "**.liquid"
       - "**/*.md"
       - "**.yml"
@@ -71,6 +73,8 @@ jobs:
     steps:
       - name: Checkout 🛎️
         uses: actions/checkout@v4
+      - name: Validate research vectors
+        run: node utils/validate_research_vectors.cjs
       - name: Setup Ruby 💎
         uses: ruby/setup-ruby@v1
         with:
